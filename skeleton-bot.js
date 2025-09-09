@@ -211,7 +211,11 @@ bots.push({
         if (target && self.canShoot) {
             const d = world.getDistanceToTarget(target.x, target.y);
             if (d <= self.range) {
-                action.shoot = world.shootAt(target.x, target.y);
+                // Don't shoot if very close to enemy (prioritize dodging)
+                const tooClose = d < self.range * 0.4; // Within 40% of range
+                if (!tooClose) {
+                    action.shoot = world.shootAt(target.x, target.y);
+                }
             }
         }
 
