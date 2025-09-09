@@ -129,9 +129,12 @@ bots.push({
         const centerX = world.map.x + world.map.width / 2;
         const centerY = world.map.y + world.map.height / 2;
 
-        // Memory for aggressive counter-attack
+        // Memory for tracking robot state
         if (!this._memory) {
-            this._memory = { lastDodgeTick: -1 };
+            this._memory = { 
+                lastDodgeTick: -1,
+                facingDirection: 0 // Track robot's facing direction
+            };
         }
         const mem = this._memory;
 
@@ -141,39 +144,105 @@ bots.push({
             return a;
         }
 
-        // 1) Simple single bullet dodging
+        // Helper function to check if shooting angle is within 180° forward arc
+        function canShootAtAngle(shootAngle, robotFacingAngle) {
+            if (robotFacingAngle === undefined) return true; // If no facing direction, allow all angles
+            const angleDiff = Math.abs(normalizeAngle(shootAngle - robotFacingAngle));
+            return angleDiff <= Math.PI / 2; // Within ±90° of facing direction
+        }
+
+        // 1) Enhanced multi-bullet dodging system
         if (bullets.length > 0) {
-            const b = bullets[0]; // Only one bullet exists
-            const timeThreshold = 30 + Math.max(0, 8 - self.stats.speed) * 2;
+            // Calculate dynamic thresholds based on robot stats and situation
+            const baseTimeThreshold = 25 + Math.max(0, 8 - self.stats.speed) * 3;
+            const baseDodgeDistance = 60 + self.stats.speed * 5; // Scale with speed
+            const emergencyTimeThreshold = 15;
             
-            // Calculate if bullet will hit us
-            const bs = b.speed || Math.hypot(b.vx, b.vy) || 0.0001;
-            const ux = b.vx / bs; // bullet direction
-            const uy = b.vy / bs;
-            const rx = self.x - b.x; // vector from bullet to us
-            const ry = self.y - b.y;
-            const along = rx * ux + ry * uy; // how far along bullet path we are
-            
-            if (along > 0) { // bullet coming toward us
+            // Analyze all bullets and create threat assessments
+            const threats = bullets.map(bullet => {
+                const bs = bullet.speed || Math.hypot(bullet.vx, bullet.vy) || 0.0001;
+                const ux = bullet.vx / bs; // bullet direction unit vector
+                const uy = bullet.vy / bs;
+                const rx = self.x - bullet.x; // vector from bullet to robot
+                const ry = self.y - bullet.y;
+                const along = rx * ux + ry * uy; // how far along bullet path we are
+                
+                if (along <= 0) return null; // bullet not coming toward us
+                
                 const px = rx - ux * along; // perpendicular offset
                 const py = ry - uy * along;
                 const perpDist = Math.hypot(px, py);
                 const tti = along / bs; // time to impact
                 
-                // Dodge if bullet will pass close and soon
-                if (perpDist < 70 && tti < timeThreshold) {
-                    const bulletAngle = Math.atan2(b.vy, b.vx);
-                    const dodgeA = bulletAngle + Math.PI / 2;
-                    const dodgeB = bulletAngle - Math.PI / 2;
+                // Calculate threat score (lower = more dangerous)
+                const threatScore = perpDist + (tti * 2); // closer + sooner = more dangerous
+                
+                return {
+                    bullet,
+                    perpDist,
+                    tti,
+                    threatScore,
+                    bulletAngle: Math.atan2(bullet.vy, bullet.vx),
+                    along
+                };
+            }).filter(t => t !== null);
+            
+            // Sort by threat level (most dangerous first)
+            threats.sort((a, b) => a.threatScore - b.threatScore);
+            
+            // Find the most threatening bullet that requires dodging
+            const primaryThreat = threats.find(t => 
+                t.perpDist < baseDodgeDistance && t.tti < baseTimeThreshold
+            );
+            
+            if (primaryThreat) {
+                // Calculate optimal escape vector considering multiple factors
+                const escapeVectors = [];
+                
+                // Generate multiple escape directions (180° arc for better movement)
+                // Focus on directions perpendicular to bullet path for optimal dodging
+                for (let angleOffset = -Math.PI/2; angleOffset <= Math.PI/2; angleOffset += Math.PI / 6) {
+                    const escapeAngle = primaryThreat.bulletAngle + angleOffset;
+                    const escapeX = self.x + Math.cos(escapeAngle) * 100; // 100px ahead
+                    const escapeY = self.y + Math.sin(escapeAngle) * 100;
                     
-                    // Pick dodge direction toward center
-                    const angleToCenter = Math.atan2(centerY - self.y, centerX - self.x);
-                    const diffA = Math.abs(normalizeAngle(dodgeA - angleToCenter));
-                    const diffB = Math.abs(normalizeAngle(dodgeB - angleToCenter));
-                    action.moveDirection = diffA <= diffB ? dodgeA : dodgeB;
+                    // Check if escape direction is valid (not into walls)
+                    // Arena has 30-pixel margin for robot boundaries
+                    const wallBuffer = 30;
+                    const isValidEscape = 
+                        escapeX > world.map.x + wallBuffer &&
+                        escapeX < world.map.x + world.map.width - wallBuffer &&
+                        escapeY > world.map.y + wallBuffer &&
+                        escapeY < world.map.y + world.map.height - wallBuffer;
                     
-                    // Shield if very close
-                    if (self.canShield && tti < 12) {
+                    if (isValidEscape) {
+                        // Calculate how well this escape avoids other threats
+                        let escapeScore = 0;
+                        for (const threat of threats.slice(0, 3)) { // Consider top 3 threats
+                            const futureX = self.x + Math.cos(escapeAngle) * threat.tti * self.stats.speed * 10;
+                            const futureY = self.y + Math.sin(escapeAngle) * threat.tti * self.stats.speed * 10;
+                            const futureDist = Math.hypot(futureX - threat.bullet.x, futureY - threat.bullet.y);
+                            escapeScore += futureDist; // Higher distance = better escape
+                        }
+                        
+                        // Prefer directions toward center of arena
+                        const angleToCenter = Math.atan2(centerY - self.y, centerX - self.x);
+                        const centerAlignment = 1 / (1 + Math.abs(normalizeAngle(escapeAngle - angleToCenter)));
+                        
+                        escapeVectors.push({
+                            angle: escapeAngle,
+                            score: escapeScore + centerAlignment * 50
+                        });
+                    }
+                }
+                
+                // Pick the best escape direction
+                if (escapeVectors.length > 0) {
+                    escapeVectors.sort((a, b) => b.score - a.score);
+                    action.moveDirection = escapeVectors[0].angle;
+                    
+                    // Use shield for emergency situations
+                    if (self.canShield && primaryThreat.tti < emergencyTimeThreshold) {
                         action.shield = true;
                     }
                 }
@@ -193,25 +262,39 @@ bots.push({
             }
         }
 
-        // 3) Simple shoot and bounce strategy
+        // 3) Strategic positioning considering shooting constraints
         if (!action.moveDirection && target) {
             const d = world.getDistanceToTarget(target.x, target.y);
+            const targetAngle = world.directionTo(target.x, target.y);
+            const shootAngle = world.shootAt(target.x, target.y);
+            
+            // Check if we can currently shoot at the target
+            const canShootTarget = canShootAtAngle(shootAngle, mem.facingDirection);
             
             if (d < self.range * 0.6) {
                 // Too close - run toward them to force bounce
-                action.moveDirection = world.directionTo(target.x, target.y);
+                action.moveDirection = targetAngle;
             } else if (d > self.range * 0.9) {
                 // Too far - get in range
-                action.moveDirection = world.directionTo(target.x, target.y);
+                action.moveDirection = targetAngle;
+            } else if (!canShootTarget) {
+                // In range but can't shoot - adjust position to face target
+                // Move perpendicular to target to get better shooting angle
+                const perpAngle = targetAngle + (Math.random() > 0.5 ? Math.PI/2 : -Math.PI/2);
+                action.moveDirection = perpAngle;
             }
-            // Good range (60-90%) - stand still and shoot
+            // Good range (60-90%) and can shoot - stand still and shoot
         }
 
         // 5) Shooting - only when safe and in good position
         if (target && self.canShoot) {
             const d = world.getDistanceToTarget(target.x, target.y);
             if (d <= self.range) {
-                action.shoot = world.shootAt(target.x, target.y);
+                const shootAngle = world.shootAt(target.x, target.y);
+                // Only shoot if angle is within 180° forward arc
+                if (canShootAtAngle(shootAngle, mem.facingDirection)) {
+                    action.shoot = shootAngle;
+                }
             }
         }
 
@@ -220,6 +303,11 @@ bots.push({
             self.shootingState === 'shooting' ||
             self.shootingState === 'recovering') {
             action.moveDirection = null;
+        }
+
+        // 7) Update facing direction based on movement
+        if (action.moveDirection !== null) {
+            mem.facingDirection = action.moveDirection;
         }
 
         return action;
